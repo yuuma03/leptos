@@ -436,6 +436,7 @@ fn element_to_tokens_ssr(
         template.push('<');
         template.push_str(&tag_name);
 
+        #[cfg(debug_assertions)]
         stmts_for_ide.save_element_completion(node);
 
         let mut inner_html = None;
@@ -1410,7 +1411,10 @@ pub(crate) fn slot_to_tokens(
 
     let props = attrs
         .clone()
-        .filter(|attr| !attr.key.to_string().starts_with("clone:"))
+        .filter(|attr| {
+            !attr.key.to_string().starts_with("bind:")
+                && !attr.key.to_string().starts_with("clone:")
+        })
         .map(|attr| {
             let name = &attr.key;
 
@@ -1425,6 +1429,16 @@ pub(crate) fn slot_to_tokens(
                 .#name(#[allow(unused_braces)] #value)
             }
         });
+
+    let items_to_bind = attrs
+        .clone()
+        .filter_map(|attr| {
+            attr.key
+                .to_string()
+                .strip_prefix("bind:")
+                .map(|ident| format_ident!("{ident}", span = attr.key.span()))
+        })
+        .collect::<Vec<_>>();
 
     let items_to_clone = attrs
         .clone()
@@ -1461,16 +1475,29 @@ pub(crate) fn slot_to_tokens(
         );
 
         if let Some(children) = children {
+            let bindables =
+                items_to_bind.iter().map(|ident| quote! { #ident, });
+
             let clonables = items_to_clone
                 .iter()
                 .map(|ident| quote! { let #ident = #ident.clone(); });
 
-            quote! {
-                .children({
-                    #(#clonables)*
+            if bindables.len() > 0 {
+                quote! {
+                    .children({
+                        #(#clonables)*
 
-                    Box::new(move |#cx| #children #view_marker)
-                })
+                        move |#cx, #(#bindables)*| #children #view_marker
+                    })
+                }
+            } else {
+                quote! {
+                    .children({
+                        #(#clonables)*
+
+                        Box::new(move |#cx| #children #view_marker)
+                    })
+                }
             }
         } else {
             quote! {}
@@ -1526,7 +1553,8 @@ pub(crate) fn component_to_tokens(
     let props = attrs
         .clone()
         .filter(|attr| {
-            !attr.key.to_string().starts_with("clone:")
+            !attr.key.to_string().starts_with("bind:")
+                && !attr.key.to_string().starts_with("clone:")
                 && !attr.key.to_string().starts_with("on:")
         })
         .map(|attr| {
@@ -1543,6 +1571,16 @@ pub(crate) fn component_to_tokens(
                 .#name(#[allow(unused_braces)] #value)
             }
         });
+
+    let items_to_bind = attrs
+        .clone()
+        .filter_map(|attr| {
+            attr.key
+                .to_string()
+                .strip_prefix("bind:")
+                .map(|ident| format_ident!("{ident}", span = attr.key.span()))
+        })
+        .collect::<Vec<_>>();
 
     let items_to_clone = attrs
         .clone()
@@ -1590,16 +1628,29 @@ pub(crate) fn component_to_tokens(
         );
 
         if let Some(children) = children {
+            let bindables =
+                items_to_bind.iter().map(|ident| quote! { #ident, });
+
             let clonables = items_to_clone
                 .iter()
                 .map(|ident| quote! { let #ident = #ident.clone(); });
 
-            quote! {
-                .children({
-                    #(#clonables)*
+            if bindables.len() > 0 {
+                quote! {
+                    .children({
+                        #(#clonables)*
 
-                    Box::new(move |#cx| #children #view_marker)
-                })
+                        move |#cx, #(#bindables)*| #children #view_marker
+                    })
+                }
+            } else {
+                quote! {
+                    .children({
+                        #(#clonables)*
+
+                        Box::new(move |#cx| #children #view_marker)
+                    })
+                }
             }
         } else {
             quote! {}
@@ -1621,7 +1672,8 @@ pub(crate) fn component_to_tokens(
     });
 
     let mut component = quote! {
-        #name(
+        ::leptos::component_view(
+            &#name,
             #cx,
             ::leptos::component_props_builder(&#name)
                 #(#props)*
@@ -1631,7 +1683,8 @@ pub(crate) fn component_to_tokens(
         )
     };
 
-    IdeTagHelper::add_component_completion(&mut component, cx, node);
+    #[cfg(debug_assertions)]
+    IdeTagHelper::add_component_completion(&mut component, node);
 
     if events.is_empty() {
         component
@@ -2043,13 +2096,12 @@ impl IdeTagHelper {
         }
     }
 
+    /// Add completion to the closing tag of the component.
     ///
-    /// Add completion to close tag of the component definition.
+    /// In order to ensure that generics are passed through correctly in the
+    /// current builder pattern, this clones the whole component constructor,
+    /// but it will never be used.
     ///
-    /// we can emit full copy of open_tag builder (close_tag.props().slots().children().build()),
-    /// but i choose to replace props with unreachable! call,
-    /// so expansion output will be shorter.
-    /// The output is looking like:
     /// ```no_build
     /// if false {
     ///     close_tag(cx, unreachable!())
@@ -2058,24 +2110,17 @@ impl IdeTagHelper {
     ///     open_tag(open_tag.props().slots().children().build())
     /// }
     /// ```
-    ///
-    /// Because element type can have generics, we cant construct simple statement like
-    /// let _ = #name; or (let _: #name = unreachable!()) both syntax require to know generics params.
     pub fn add_component_completion(
         component: &mut TokenStream,
-        cx: &Ident,
         node: &NodeElement,
     ) {
         // emit ide helper info
-        if let Some(close_tag) = node.close_tag.as_ref().map(|c| &c.name) {
-            let name = close_tag;
+        if node.close_tag.is_some() {
+            let constructor = component.clone();
             *component = quote! {
                 if false {
                     #[allow(unreachable_code)]
-                    #name(
-                        #cx,
-                        unreachable!()
-                    )
+                    #constructor
                 } else {
                     #component
                 }
